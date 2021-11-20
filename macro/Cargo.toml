@@ -1,0 +1,12 @@
+[package]
+name = "rsweb_macros"
+version = "0.1.0"
+edition = "2018"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "1.0.81", features = ["full"] }
+quote = "1.0.3"
+proc-macro2 = "1.0"
