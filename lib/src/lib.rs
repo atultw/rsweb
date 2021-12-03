@@ -34,6 +34,7 @@ mod tests {
     use crate::application::{Field, Fields, to_map};
     use crate::data_mongo::DbMongo;
     use crate::frontend_http::{Application, CollectionRoute, Context, DataResource, FrontendExtended, launch, Protected, SingleRoute};
+    use crate::frontend_http::MapOrStruct::Map;
 
     // example app using the framework
     #[tokio::test]
@@ -42,12 +43,21 @@ mod tests {
 
         #[derive(Serialize, Deserialize, Fields)]
         struct User {
-            pub id: u32,
+            #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+            pub id: Option<u32>,
             pub username: String,
         }
         impl DataResource for User {
             fn get_collection_name() -> String {
                 String::from("user")
+            }
+
+            fn get_id(&self) -> Option<u32> {
+                self.id
+            }
+
+            fn set_id(&mut self, id: Option<u32>) {
+                self.id = id;
             }
         }
 
@@ -60,7 +70,7 @@ mod tests {
         impl Context for ExampleContext {
             async fn generate(req: Request<Body>) -> Self {
                 let ctx = ExampleContext {
-                    signed_in: User { id: 3, username: "john.doe".to_string() },
+                    signed_in: User { id: Some(3), username: "john.doe".to_string() },
                     request: req,
                 };
                 return ctx;
@@ -69,7 +79,8 @@ mod tests {
 
         #[derive(Serialize, Deserialize, Fields)]
         struct Movie {
-            pub id: u32,
+            #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+            pub id: Option<u32>,
             pub year: u32,
             pub title: String,
             pub user_id: u32,
@@ -77,6 +88,14 @@ mod tests {
         impl DataResource for Movie {
             fn get_collection_name() -> String {
                 "movies".to_string()
+            }
+
+            fn get_id(&self) -> Option<u32> {
+                self.id
+            }
+
+            fn set_id(&mut self, id: Option<u32>) {
+                self.id = id;
             }
         }
 
@@ -95,40 +114,41 @@ mod tests {
             }),
         };
 
-        let r: SingleRoute<Movie, ExampleContext> = SingleRoute {
-            path: "/movies/:id".to_string(),
-            methods: vec![Method::GET],
-            check_to_view: Box::new(|_: &Movie, _: &ExampleContext| Box::pin(async { true })),
-            filter_view_data: |ctx, data| {
-                let mut map = to_map(&data).unwrap();
-                map.insert(String::from("years_since"), json!(2020-data.year));
-                if ctx.signed_in.id != data.user_id {
-                    map.remove("user_id");
-                }
-                map
-            },
-        };
-        app.add_route(Arc::new(r));
+        app.add_route(Arc::new(
+            SingleRoute {
+                path: "/movies/:id".to_string(),
+                methods: vec![Method::GET],
+                check_to_view: |_: &Movie, _: &ExampleContext| Box::pin(async { true }),
+                filter_view_data: |ctx, data| {
+                    let mut map = to_map(&data).unwrap();
+                    map.insert(String::from("years_since"), json!(2030-data.year));
+                    if ctx.signed_in.id != Some(data.user_id) {
+                        map.remove("user_id");
+                    }
+                    Map(map)
+                },
+            }
+        ));
 
+        app.add_route(Arc::new(
+            SingleRoute::<User, ExampleContext> {
+                path: "/users/:id".to_string(),
+                methods: vec![Method::GET],
+                check_to_view: |_, _| Box::pin(async { true }),
+                filter_view_data: |ctx, data| {
+                    let serialized = serde_json::ser::to_string(&data).unwrap();
+                    let mut map: HashMap<String, Value> = serde_json::de::from_str(&serialized).unwrap();
+                    if ctx.signed_in.id != data.id {
+                        map.remove("id");
+                    }
+                    Map(map)
+                },
+            }));
 
-        let r: SingleRoute<User, ExampleContext> = SingleRoute {
-            path: "/users/:id".to_string(),
-            methods: vec![Method::GET],
-            check_to_view: Box::new(|_, _| Box::pin(async { true })),
-            filter_view_data: |ctx, data| {
-                let serialized = serde_json::ser::to_string(&data).unwrap();
-                let mut map: HashMap<String, Value> = serde_json::de::from_str(&serialized).unwrap();
-                if ctx.signed_in.id != data.id {
-                    map.remove("id");
-                }
-                map
-            },
-        };
-        app.add_route(Arc::new(r));
         app.add_route(Arc::new(
             CollectionRoute::<Movie, ExampleContext> {
                 path: "/movies".to_string(),
-                methods: vec![Method::GET],
+                methods: vec![Method::GET, Method::POST],
                 check_to_view: |_| Box::pin(async { true }),
                 filter_one: |_, data| { to_map(&data).unwrap() },
             }
@@ -148,27 +168,4 @@ mod tests {
             println!("uh oh")
         }
     }
-    //
-    // pub async fn db_get<T: de::DeserializeOwned>(app: &Application) -> Result<T, hyper::Error> {
-    //     // Look up one document:
-    //     let movie = app.data_source
-    //         .database("app")
-    //         .collection("movies")
-    //         .find_one(Some(doc! { "_id": "617330461403e1d395959d92" }), None)
-    //         .await
-    //         .unwrap()
-    //         .expect("Document not found");
-    //
-    //     // Deserialize the document into a Movie instance
-    //     let loaded_movie_struct: T = bson::from_bson(bson::Bson::Document(movie)).unwrap();
-    //     return Ok(loaded_movie_struct);
-    // }
-    //
-    // #[derive(Serialize, Deserialize)]
-    // pub struct Movie {
-    //     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
-    //     id: Option<bson::oid::ObjectId>,
-    //     title: String,
-    //     year: i32,
-    // }
 }

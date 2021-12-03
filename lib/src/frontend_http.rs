@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::TryStreamExt;
-use hyper::{Body, Error, Method, Request, Response, Server};
+use hyper::{Body, Error, Method, Request, Response, Server, StatusCode};
 use hyper::server::conn::AddrIncoming;
 use mongodb::bson;
+use mongodb::bson::Bson::DateTime;
 use mongodb::bson::doc;
 use routerify::{RouterBuilder, RouterService};
 use routerify::ext::RequestExt;
@@ -16,21 +19,27 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::application::{Database, Fields};
+use crate::application::{Database, Fields, Filter};
+use crate::frontend_http::MapOrStruct::{Map, Struct};
 
 #[async_trait]
 pub trait Route<R, S> where R: Serialize + Send + Sync, S: Context + Send + Sync {
     async fn generate_context(&self, request: Request<Body>) -> S;
     async fn handler_get<DB: Database + Send + Sync>(&self, data_layer: Arc<DB>, req: Request<Body>) -> Result<Response<Body>, Infallible>;
+    async fn handler_post<DB: Database + Send + Sync>(&self, data_layer: Arc<DB>, req: Request<Body>) -> Result<Response<Body>, Infallible>;
     fn methods(&self) -> &Vec<Method>;
     fn path(&self) -> &String;
+}
+
+pub enum MapOrStruct<T: Serialize + Send + Sync> {
+    Map(HashMap<String, Value>), Struct(T)
 }
 
 pub struct SingleRoute<R, S> where R: Serialize + Send + Sync, S: Context + Send + Sync {
     pub path: String,
     pub methods: Vec<Method>,
-    pub check_to_view: Box<dyn Fn(&R, &S) -> BoxFuture<'static, bool>+Send+Sync>,
-    pub filter_view_data: fn(&S, R) -> HashMap<String, Value>,
+    pub check_to_view: fn(&R, &S) -> BoxFuture<'static, bool>,
+    pub filter_view_data: fn(&S, R) -> MapOrStruct<R>,
     // pub filters_get: Vec<fn (&R, &mut S, &HashMap<String, serde_json::value::Value>)>
 }
 
@@ -53,11 +62,11 @@ impl<R, S> Route<R, S> for SingleRoute<R, S> where R: DataResource + Fields + Se
         S::generate(request).await
     }
     async fn handler_get<DB: Database + Send + Sync>(&self, data_layer: Arc<DB>, req: Request<Body>) -> Result<Response<Body>, Infallible> {
-        let mut filter = doc! {};
+        let mut filter = DB::Filter::default();
 
         if let Some(id) = req.param("id") {
             let parsed: u32 = id.parse().expect("[webf] error parsing id query param");
-            filter.insert("id", parsed);
+            filter.insert("_id", parsed);
         }
 
         let ctx = &self.generate_context(req).await;
@@ -68,11 +77,18 @@ impl<R, S> Route<R, S> for SingleRoute<R, S> where R: DataResource + Fields + Se
             if !(&self.check_to_view)(&data, &ctx).await {
                 return Ok(Response::new(Body::from("access denied")))
             }
-            let map = (&self.filter_view_data)(&ctx, data);
-            Ok(Response::new(Body::from(serde_json::ser::to_string(&map).unwrap())))
+            let filtered = (&self.filter_view_data)(&ctx, data);
+            match filtered {
+                Map(map) => { Ok(Response::new(Body::from(serde_json::ser::to_string(&map).unwrap()))) }
+                Struct(f) => { Ok(Response::new(Body::from(serde_json::ser::to_string(&f).unwrap()))) }
+            }
         } else {
             Ok(Response::builder().status(404).body(Body::from("")).unwrap())
         }
+    }
+
+    async fn handler_post<DB: Database + Send + Sync>(&self, data_layer: Arc<DB>, req: Request<Body>) -> Result<Response<Body>, Infallible> {
+        Ok(Response::builder().status(405).body(Body::from("")).unwrap())
     }
 
     fn methods(&self) -> &Vec<Method> {
@@ -105,7 +121,7 @@ impl<R, S> Route<R, S> for CollectionRoute<R, S> where R: DataResource + Fields 
 
         println!("{:?}", params.iter());
 
-        let mut filter = doc! {};
+        let mut filter = DB::Filter::default();
 
         for key in R::fields() {
             let name = &*key.name;
@@ -154,6 +170,28 @@ impl<R, S> Route<R, S> for CollectionRoute<R, S> where R: DataResource + Fields 
         }
     }
 
+    async fn handler_post<DB: Database + Send + Sync>(&self, data_layer: Arc<DB>, req: Request<Body>) -> Result<Response<Body>, Infallible> {
+        if let Ok(body) = hyper::body::to_bytes(req.into_body()).await {
+            let res : serde_json::Result<R> = serde_json::de::from_slice(&*body.to_vec());
+            if let Ok(mut deser) = res {
+                deser.set_id(Some(std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32));
+                let res = data_layer.insert_one(R::get_collection_name(), deser).await;
+                match res {
+                    Ok(id) => {
+                        Ok(Response::new(Body::from(id.to_string())))
+                    }
+                    Err(_) => {
+                        Ok(Response::builder().status(500).body(Body::from("Error inserting")).unwrap())
+                    }
+                }
+            } else {
+                Ok(Response::new(Body::from("error deserializing")))
+            }
+        } else {
+            Ok(Response::new(Body::from("internal server error")))
+        }
+    }
+
     fn methods(&self) -> &Vec<Method> {
         &self.methods
     }
@@ -171,6 +209,8 @@ pub trait Context {
 
 pub trait DataResource: Serialize + DeserializeOwned {
     fn get_collection_name() -> String;
+    fn get_id(&self) -> Option<u32>;
+    fn set_id(&mut self, id: Option<u32>);
 }
 
 #[async_trait]
@@ -218,7 +258,7 @@ impl<T> Application<T> where T: Database + 'static + Send + Sync {
         for method in route.methods() {
             match method {
                 &Method::GET => {
-                    println!("[webf] added route {}", route.path());
+                    println!("[webf] added GET route {}", route.path());
                     let handler = {
                         let ds = self.data_source.clone();
                         let route = route.clone();
@@ -232,6 +272,22 @@ impl<T> Application<T> where T: Database + 'static + Send + Sync {
                     };
                     let mut refer = std::mem::take(&mut self.router_builder);
                     self.router_builder = refer.get(route.path(), handler);
+                }
+                &Method::POST => {
+                    println!("[webf] added POST route {}", route.path());
+                    let handler = {
+                        let ds = self.data_source.clone();
+                        let route = route.clone();
+                        move |req| {
+                            let ds = ds.clone();
+                            let route = route.clone();
+                            async move {
+                                route.handler_post(ds, req).await
+                            }
+                        }
+                    };
+                    let mut refer = std::mem::take(&mut self.router_builder);
+                    self.router_builder = refer.post(route.path(), handler);
                 }
                 _ => {
                     return
