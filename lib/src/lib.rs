@@ -13,23 +13,16 @@ mod frontend_http;
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Borrow;
     use std::collections::HashMap;
-    use std::convert::Infallible;
-    use std::error::Error;
     use std::net::SocketAddr;
-    use std::pin::Pin;
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use futures::future::BoxFuture;
     use hyper::{Body, Method, Request, Response, Server};
     use mongodb::{bson, Client};
     use mongodb::options::ClientOptions;
     use routerify::{RouterBuilder, RouterService};
-    use serde::de;
     use serde_json::Value;
-    use serde_json::value::Value::Number;
 
     use crate::application::{Field, Fields, to_map};
     use crate::data_mongo::DbMongo;
@@ -39,8 +32,6 @@ mod tests {
     // example app using the framework
     #[tokio::test]
     async fn server_test() {
-        println!("entrypoint");
-
         #[derive(Serialize, Deserialize, Fields)]
         struct User {
             #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -114,7 +105,7 @@ mod tests {
             }),
         };
 
-        app.add_route(Arc::new(
+        app.add_route(
             SingleRoute {
                 path: "/movies/:id".to_string(),
                 methods: vec![Method::GET],
@@ -128,9 +119,9 @@ mod tests {
                     Map(map)
                 },
             }
-        ));
+        );
 
-        app.add_route(Arc::new(
+        app.add_route(
             SingleRoute::<User, ExampleContext> {
                 path: "/users/:id".to_string(),
                 methods: vec![Method::GET],
@@ -143,16 +134,16 @@ mod tests {
                     }
                     Map(map)
                 },
-            }));
+            });
 
-        app.add_route(Arc::new(
+        app.add_route(
             CollectionRoute::<Movie, ExampleContext> {
                 path: "/movies".to_string(),
                 methods: vec![Method::GET, Method::POST],
                 check_to_view: |_| Box::pin(async { true }),
                 filter_one: |_, data| { to_map(&data).unwrap() },
             }
-        ));
+        );
 
         let service = RouterService::new(app.router_builder.build().unwrap()).unwrap();
 
@@ -162,10 +153,10 @@ mod tests {
         // Create a server by passing the created service to `.serve` method.
         let server = Server::bind(&addr).serve(service);
 
-        println!("App is running on: {}", addr);
+        println!("App will run on: {}", addr);
 
         if let Err(e) = server.await {
-            println!("uh oh")
+            println!("Failed to start app")
         }
     }
 }

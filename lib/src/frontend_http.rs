@@ -254,7 +254,8 @@ pub struct Application<T: Database> {
 
 impl<T> Application<T> where T: Database + 'static + Send + Sync {
     pub fn add_route<R: 'static + DataResource + Send + Sync, S: 'static +  Context + Send + Sync, RT: 'static + Route<R, S> + Send + Sync>
-    (&mut self, route: Arc<RT>) {
+    (&mut self, rt: RT) {
+        let route = Arc::new(rt);
         for method in route.methods() {
             match method {
                 &Method::GET => {
